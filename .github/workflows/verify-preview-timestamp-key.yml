@@ -1,0 +1,68 @@
+name: Verify Preview timestamp key
+run-name: Verify Preview timestamp key (${{ inputs.check_id }})
+
+'on':
+  workflow_dispatch:
+    inputs:
+      check_id:
+        description: Verification run label
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  verify:
+    if: github.repository == 'colvia/downloads' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    environment:
+      name: preview-timestamp
+      deployment: false
+    steps:
+      - name: Compare the timestamp key with operating root v1
+        shell: bash
+        env:
+          COLVIA_TIMESTAMP_KEY_B64: ${{ secrets.COLVIA_TIMESTAMP_KEY_B64 }}
+        run: |
+          python3 -I -S -B - <<'PY'
+          import base64
+          import hashlib
+          import hmac
+          import json
+          import os
+          import subprocess
+          
+          # Pins from the accepted operating root v1.
+          ROOT_SHA256 = "b249534b52b2418a65459bc4d5b3243c3bdb3c58dcb68bc110b6122be336a1d5"
+          EXPECTED_ID = "0cb049a2076364d1f8b8f2a3af3284c5ad583a24edc1ea09964d4153a50476f1"
+          EXPECTED_PUBLIC_SHA256 = "4199ca9a935f361c558f74d4d19decca5c6ce965d459d947a3f1e8317f9e3fad"
+          
+          def check():
+              try:
+                  seed = base64.b64decode(os.environ.pop("COLVIA_TIMESTAMP_KEY_B64", ""), validate=True)
+                  if len(seed) != 32:
+                      return "INVALID-INPUT"
+                  private_der = bytes.fromhex("302e020100300506032b657004220420") + seed
+                  result = subprocess.run(
+                      ["/usr/bin/openssl", "pkey", "-inform", "DER", "-pubout", "-outform", "DER"],
+                      input=private_der, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env={}, timeout=15,
+                  )
+                  prefix = bytes.fromhex("302a300506032b6570032100")
+                  if result.returncode or not result.stdout.startswith(prefix) or len(result.stdout) != len(prefix) + 32:
+                      return "DERIVATION-FAILED"
+                  public = result.stdout[len(prefix):]
+                  data = {"keytype":"ed25519","scheme":"ed25519","keyval":{"public":public.hex()}}
+                  canonical = json.dumps(data, separators=(",",":"), sort_keys=True).encode("ascii")
+                  keyid = hashlib.sha256(canonical).hexdigest()
+                  public_hash = hashlib.sha256(public).hexdigest()
+                  if hmac.compare_digest(keyid, EXPECTED_ID) and hmac.compare_digest(public_hash, EXPECTED_PUBLIC_SHA256):
+                      return "MATCH"
+                  return "MISMATCH"
+              except (ValueError, OSError, subprocess.TimeoutExpired):
+                  return "DERIVATION-FAILED"
+          
+          status = check()
+          print("COLVIA-TIMESTAMP-RUNNER-KEY-" + status)
+          raise SystemExit(0 if status == "MATCH" else 1)
+          PY
