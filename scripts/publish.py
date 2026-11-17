@@ -1,5 +1,6 @@
 """Publish one pre-approved Colvia Preview bundle. Local validation never uses GitHub."""
 import argparse
+from datetime import datetime, timezone
 from dataclasses import dataclass
 import hashlib
 import json
@@ -18,6 +19,8 @@ import zipfile
 REPO = "colvia/downloads"
 BASE = "https://colvia.github.io/downloads/"
 MARKER = "preview/publication.json"
+APPROVAL = "preview/publish-manifest.json"
+FRESHNESS = "preview/timestamp-publication.json"
 MANIFEST = "publish-manifest.json"
 ARCHIVE = "publish-input.zip"
 PLATFORMS = {"macos-arm64": "install.sh", "windows-x64": "install.ps1",
@@ -129,6 +132,7 @@ class Plan:
     tag: str
     digest: str
     data: dict
+    raw: bytes = b""
 
     @property
     def marker(self):
@@ -192,7 +196,7 @@ def read_plan(raw, tag, digest):
     require(len(Plan(tag, digest, data).marker) <= JSON_LIMIT, "publication marker is too large")
     for name in ("notes", "checksums"):
         require(valid_pin(data[name]) and data[name]["bytes"] <= JSON_LIMIT, f"invalid {name}")
-    return Plan(tag, digest, data)
+    return Plan(tag, digest, data, raw)
 
 
 def unpack(plan, archive, work):
@@ -270,7 +274,7 @@ def platform_url(platform):
     return BASE + f"preview/{platform}/"
 
 
-def verify_trust(plan, payload, work, *, channel=CHANNEL):
+def verify_trust(plan, payload, work, *, channel=CHANNEL, timestamps=None):
     from tuf.api.exceptions import DownloadError, DownloadHTTPError, RepositoryError
     from tuf.ngclient import Updater
     from tuf.ngclient.fetcher import FetcherInterface
@@ -282,8 +286,11 @@ def verify_trust(plan, payload, work, *, channel=CHANNEL):
             path = prefix + url[len(origin):]
             if path not in plan.data["pages"]:
                 raise DownloadHTTPError("absent from approved Pages snapshot", 404)
-            with (payload / path).open("rb") as stream:
-                yield from iter(lambda: stream.read(CHUNK), b"")
+            if timestamps and path in timestamps:
+                yield timestamps[path]
+            else:
+                with (payload / path).open("rb") as stream:
+                    yield from iter(lambda: stream.read(CHUNK), b"")
 
     for platform, cfg in plan.data["platforms"].items():
         prefix = f"preview/{platform}/"
@@ -427,6 +434,149 @@ def live_pinned_json(path, expected):
     return raw
 
 
+def timestamp_path(platform):
+    return f"preview/{platform}/metadata/timestamp.json"
+
+
+def original_timestamp_path(platform):
+    return f"preview/{platform}/approved-timestamp.json"
+
+
+def public_document(path, *, missing=False):
+    try:
+        with open_public(BASE + path) as response:
+            require(response.status == 200, f"unexpected response for {path}")
+            raw = response.read(JSON_LIMIT + 1)
+            require(len(raw) <= JSON_LIMIT, f"oversized Pages document: {path}")
+            return raw
+    except urllib.error.HTTPError as error:
+        if missing and error.code == 404:
+            error.close()
+            return None
+        raise
+
+
+def approved_live_plan(marker, raw, digest):
+    require(marker is not None and raw is not None, "no approved Pages publication")
+    head = load_json(marker)
+    require(isinstance(head, dict), "invalid publication marker")
+    plan = read_plan(raw, head.get("tag"), digest)
+    require(marker == plan.marker, "live approval differs from the approved manifest")
+    return plan
+
+
+def freshness_pins(plan, record_raw):
+    pages = dict(plan.data["pages"])
+    if record_raw is not None:
+        record = load_json(record_raw)
+        require(isinstance(record, dict) and set(record) == {"schema", "manifest_sha256", "timestamps"}
+                and type(record["schema"]) is int and record["schema"] == 1
+                and record["manifest_sha256"] == plan.digest, "timestamp record belongs to a different approval")
+        rows = record["timestamps"]
+        require(isinstance(rows, dict) and rows.keys() == {timestamp_path(p) for p in PLATFORMS},
+                "timestamp record must include all three platforms")
+        for path, row in rows.items():
+            require(isinstance(row, dict) and set(row) == {"bytes", "sha256", "version", "expires"},
+                    f"invalid timestamp record entry: {path}")
+            file = {name: row[name] for name in ("bytes", "sha256")}
+            require(valid_pin(file) and file["bytes"] <= JSON_LIMIT, f"invalid timestamp pin: {path}")
+            pages[path] = file
+    return pages
+
+
+def metadata(raw, role):
+    from tuf.api.metadata import Metadata
+    load_json(raw)  # Reject ambiguous JSON before TUF parses the same bytes.
+    value = Metadata.from_bytes(raw)
+    require(value.signed.type == role and type(value.signed.version) is int and value.signed.version > 0,
+            f"wrong or invalid metadata role: {role}")
+    return value
+
+
+def timestamp_row(raw, value):
+    return {"bytes": len(raw), "sha256": sha(raw), "version": value.signed.version,
+            "expires": value.signed.expires.isoformat()}
+
+
+@dataclass(frozen=True)
+class TimestampState:
+    current: object
+    root: object
+    upstream_expires: datetime
+    raw: bytes
+
+
+def referenced_metadata(read, pages, prefix, role, reference):
+    path = prefix + f"{reference.version}.{role}.json"
+    require(path in pages and reference.length == pages[path]["bytes"]
+            and reference.hashes == {"sha256": pages[path]["sha256"]}, f"{role} differs from approval")
+    raw = read(path, pages[path])
+    reference.verify_length_and_hashes(raw)
+    value = metadata(raw, role)
+    require(value.signed.version == reference.version, f"wrong {role} version")
+    return value
+
+
+def check_timestamp_state(plan, record_raw, read, *, at, upstream_fresh):
+    """Verify approval, exact snapshot lineage and the current timestamp, including after its expiry."""
+    from tuf.api.exceptions import RepositoryError
+
+    pages = freshness_pins(plan, record_raw)
+    expected_rows = load_json(record_raw)["timestamps"] if record_raw is not None else {}
+    states = {}
+    for platform in PLATFORMS:
+        try:
+            prefix = f"preview/{platform}/metadata/"
+            path = timestamp_path(platform)
+            root_pin = plan.data["pages"].get(prefix + "1.root.json")
+            require(root_pin is not None and root_pin["sha256"] == plan.data["root_sha256"],
+                    "public root does not match the approved root")
+            trusted = metadata(read(prefix + "1.root.json", root_pin), "root")
+            require(trusted.signed.version == 1 and trusted.signed.consistent_snapshot is True,
+                    "expected the approved initial consistent-snapshot root")
+            verify = trusted.signed.verify_delegate
+            verify("root", trusted.signed_bytes, trusted.signatures)
+            approved = metadata(read(original_timestamp_path(platform), plan.data["pages"][path]), "timestamp")
+            live_raw = read(path, pages[path])
+            live = metadata(live_raw, "timestamp")
+            verify("timestamp", approved.signed_bytes, approved.signatures)
+            verify("timestamp", live.signed_bytes, live.signatures)
+            require(live.signed.snapshot_meta.to_dict() == approved.signed.snapshot_meta.to_dict(),
+                    "timestamp selects a different snapshot")
+            if record_raw is not None:
+                require(live.signed.version > approved.signed.version
+                        and expected_rows[path] == timestamp_row(live_raw, live),
+                        "timestamp version or record differs")
+            snapshot = referenced_metadata(read, pages, prefix, "snapshot", approved.signed.snapshot_meta)
+            verify("snapshot", snapshot.signed_bytes, snapshot.signatures)
+            targets = referenced_metadata(read, pages, prefix, "targets", snapshot.signed.meta["targets.json"])
+            verify("targets", targets.signed_bytes, targets.signatures)
+            selected = targets.signed.targets[plan.data["platforms"][platform]["target"]]
+            zip_path = plan.data["release_zips"][f"colvia-{plan.tag}-{platform}.zip"]
+            zip_pin = plan.data["pages"][zip_path]
+            require(selected.length == zip_pin["bytes"] and selected.hashes == {"sha256": zip_pin["sha256"]},
+                    "targets selects a different ZIP")
+            upstream_expires = min(trusted.signed.expires, snapshot.signed.expires, targets.signed.expires)
+            require(not upstream_fresh or at < upstream_expires, "root, snapshot or targets has expired")
+            states[path] = TimestampState(live, trusted, upstream_expires, live_raw)
+        except (Stop, ValueError, KeyError, TypeError, RepositoryError) as error:
+            raise Stop(f"{platform}: {error}") from error
+    return states
+
+
+def live_freshness(marker, digest, *, upstream_fresh=True, require_approval=False):
+    record = public_document(FRESHNESS, missing=True)
+    raw = public_document(APPROVAL, missing=True) if record is not None or require_approval else None
+    if record is None:
+        if require_approval:
+            approved_live_plan(marker, raw, digest)
+        return record, {}, None
+    plan = approved_live_plan(marker, raw, digest)
+    states = check_timestamp_state(plan, record, live_pinned_json, at=datetime.now(timezone.utc),
+                                   upstream_fresh=upstream_fresh)
+    return record, {path: state.raw for path, state in states.items()}, freshness_pins(plan, record)
+
+
 def verify_timestamp_progress(old_pages, payload):
     for platform in PLATFORMS:
         path = f"preview/{platform}/metadata/timestamp.json"
@@ -449,21 +599,43 @@ def verify_timestamp_progress(old_pages, payload):
 
 
 def verify_live(plan):
-    verify_live_marker(plan.tag, plan.digest, sha(plan.marker))
+    return verify_live_marker(plan.tag, plan.digest, sha(plan.marker))
 
 
-def verify_live_marker(tag, manifest_digest, marker_digest):
+def verify_live_marker(tag, manifest_digest, marker_digest, *, require_approval=False):
     live = read_marker()
     require(live is not None and is_sha(marker_digest) and sha(live) == marker_digest,
             "Pages is not serving the approved publication marker")
     marker = load_json(live)
     require(marker["tag"] == tag and marker["manifest_sha256"] == manifest_digest, "Pages publication identity differs")
     site_files(marker["pages"])
-    for path, expected in sorted(marker["pages"].items()):
+    record, stamps, effective = live_freshness(live, manifest_digest, require_approval=require_approval)
+    if require_approval and record is None:
+        for platform in PLATFORMS:
+            live_pinned_json(original_timestamp_path(platform), marker["pages"][timestamp_path(platform)])
+    for path, expected in sorted((effective or marker["pages"]).items()):
         with open_public(BASE + path) as response:
             require(response.status == 200 and pin(response, expected["bytes"]) == expected,
                     f"Pages bytes differ: {path}")
-    require(read_marker() == live, "Pages changed during verification")
+    require(read_marker() == live and public_document(FRESHNESS, missing=True) == record,
+            "Pages changed during verification")
+    return stamps
+
+
+def seed_timestamp_baseline(plan, verified_timestamps):
+    expected = {APPROVAL: {"bytes": len(plan.raw), "sha256": plan.digest}}
+    expected.update({original_timestamp_path(platform): plan.data["pages"][timestamp_path(platform)]
+                     for platform in PLATFORMS})
+    documents = {path: public_document(path, missing=True) for path in expected}
+    require(read_marker() == plan.marker, "Pages changed during timestamp baseline verification")
+    if all(raw is None for raw in documents.values()):
+        require(not verified_timestamps and public_document(FRESHNESS, missing=True) is None,
+                "cannot seed a timestamp baseline over a refresh record")
+        return True
+    for path, raw in documents.items():
+        require(raw is not None and {"bytes": len(raw), "sha256": sha(raw)} == expected[path],
+                f"timestamp baseline is partial or differs from approval: {path}")
+    return False
 
 
 def render_pages(plan, payload, work):
@@ -474,6 +646,10 @@ def render_pages(plan, payload, work):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(payload / path, target)
     (site / MARKER).write_bytes(plan.marker)
+    require(sha(plan.raw) == plan.digest, "missing original approved manifest")
+    (site / APPROVAL).write_bytes(plan.raw)
+    for platform in PLATFORMS:
+        shutil.copyfile(site / timestamp_path(platform), site / original_timestamp_path(platform))
 
 
 class GitHub:
@@ -655,9 +831,15 @@ def main():
         return
     require(args.manifest is None and args.archive is None, "workflow reads inputs from its staging draft")
     if args.step == "verify":
-        verify_live_marker(tag, digest, os.environ.get("PAGES_MARKER_SHA256", ""))
+        verify_live_marker(tag, digest, os.environ.get("PAGES_MARKER_SHA256", ""), require_approval=True)
         print("Verified anonymous Pages responses")
         return
+    seed = os.environ.get("SEED_TIMESTAMP_BASELINE", "false")
+    require(seed in ("true", "false"), "invalid timestamp baseline selection")
+    seed = seed == "true"
+    if seed:
+        require(args.step == "prepare" and tag == "v0.1.1" and os.environ.get("PAGES_ONLY") == "true",
+                "timestamp baseline seeding requires v0.1.1 and a Pages-only run")
     github = GitHub()
     args.work.mkdir()
     staging = get_staging(github, tag)
@@ -665,30 +847,43 @@ def main():
     github.download(staging[MANIFEST], manifest_path, JSON_LIMIT)
     plan = read_plan(bounded_bytes(manifest_path), tag, digest)
     print(f"Approved publication: {plan.tag}, {plan.digest}, source {plan.data['source_commit']}")
-    if args.step == "release":
-        verify_live(plan)
+    timestamps = verify_live(plan) if args.step == "release" else None
     archive_path = args.work / ARCHIVE
     github.download(staging[ARCHIVE], archive_path, LIMIT)
     payload = unpack(plan, archive_path, args.work)
     if args.step == "prepare":
-        verify_trust(plan, payload, args.work)
+        live = read_marker()
+        if seed:
+            require(live == plan.marker, "live Pages does not match the approved v0.1.1 publication")
+        timestamps = verify_live(plan) if live == plan.marker else None
+        verify_trust(plan, payload, args.work, timestamps=timestamps)
         review_requested = os.environ.get("REVIEW_INSTALLATION", "false")
         require(review_requested in ("true", "false"), "invalid installation review selection")
         review = plan.data["previous_manifest_sha256"] is None or review_requested == "true"
         if review:
             github.require_release_review()
-        deploy = decide_pages(plan, read_marker(), first_pages_is_empty,
-                              lambda old: verify_timestamp_progress(old, payload))
+        def verify_predecessor(old):
+            previous = plan.data["previous_manifest_sha256"]
+            record, _, effective = live_freshness(live, previous, upstream_fresh=False)
+            verify_timestamp_progress(effective or old, payload)
+            require(read_marker() == live and public_document(FRESHNESS, missing=True) == record,
+                    "Pages changed during predecessor verification")
+
+        if seed:
+            deploy = seed_timestamp_baseline(plan, timestamps)
+            print("Adding the four approved timestamp baseline files" if deploy
+                  else "Approved timestamp baseline already live; skipping deployment")
+        else:
+            deploy = decide_pages(plan, live, first_pages_is_empty, verify_predecessor)
+            if not deploy:
+                print("Approved Pages snapshot already live; skipping deployment")
         if deploy:
             render_pages(plan, payload, args.work)
-        else:
-            verify_live(plan)
-            print("Approved Pages snapshot already live; skipping deployment")
         with open(os.environ["GITHUB_OUTPUT"], "a") as output:
             output.write(f"deploy={str(deploy).lower()}\nmarker_sha256={sha(plan.marker)}\n")
             output.write(f"environment={'release-publication' if review else 'preview-release'}\n")
     else:
-        verify_trust(plan, payload, args.work)
+        verify_trust(plan, payload, args.work, timestamps=timestamps)
         complete_release(github, plan, payload)
 
 
