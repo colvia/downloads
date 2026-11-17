@@ -4,12 +4,18 @@ import base64
 from datetime import datetime, timedelta, timezone
 import os
 from pathlib import Path
+import signal
 import sys
+import time
+from urllib.error import HTTPError
 
 import publish as pub
 
 TIMESTAMP_DAYS = 14
 WARNING_DAYS = 21
+VISIBILITY_LIMIT_SECONDS = 120
+VISIBILITY_POLL_SECONDS = 5
+PREVIOUS_RECORD = "previous-timestamp-publication.json"
 
 
 def require_actions():
@@ -110,6 +116,8 @@ def prepare(work, approval_digest, signer_factory, *, at):
     pub.check_timestamp_state(plan, next_record, local_read, at=at, upstream_fresh=True)
     ensure_publication_is_current(marker, current_record)
 
+    # Keep the verified predecessor outside the upload directory for the post-deploy check.
+    (work / PREVIOUS_RECORD).write_bytes(current_record or b"")
     # This is the sole directory the Pages upload step may use.
     staged.rename(work / "site")
     return min(state.upstream_expires for state in states.values())
@@ -120,12 +128,101 @@ def verify(work, approval_digest, *, at):
     marker = pub.bounded_bytes(site / pub.MARKER)
     plan = pub.approved_live_plan(marker, pub.bounded_bytes(site / pub.APPROVAL), approval_digest)
     expected_record = pub.bounded_bytes(site / pub.FRESHNESS)
-    ensure_publication_is_current(marker, expected_record)
-    pub.require(pub.public_document(pub.APPROVAL) == plan.raw, "public manifest differs from approval")
-    states = pub.check_timestamp_state(plan, expected_record, pub.live_pinned_json, at=at, upstream_fresh=True)
-    pub.require(all(state.current.signed.expires > at for state in states.values()), "public timestamp has expired")
-    ensure_publication_is_current(marker, expected_record)
-    return min(state.upstream_expires for state in states.values())
+    previous_record = pub.bounded_bytes(work / PREVIOUS_RECORD) or None
+    pub.require(pub.public_document(pub.APPROVAL) == plan.raw, f"{pub.APPROVAL}: public manifest differs")
+
+    def pin(raw):
+        return {"bytes": len(raw), "sha256": pub.sha(raw)}
+
+    paths = tuple(pub.timestamp_path(platform) for platform in pub.PLATFORMS)
+    old_pins = pub.freshness_pins(plan, previous_record)
+    new_pins = pub.freshness_pins(plan, expected_record)
+    old_pins[pub.FRESHNESS] = pin(previous_record) if previous_record is not None else None
+    new_pins[pub.FRESHNESS] = pin(expected_record)
+    deadline = time.monotonic() + VISIBILITY_LIMIT_SECONDS
+    pending = {}
+    last_pending = {}
+    reading_path = None
+
+    def timed_out(_signum=None, _frame=None):
+        detail = last_pending | pending
+        if reading_path is not None:
+            detail[reading_path] = "HTTPS read still in progress"
+        items = "; ".join(f"{path}: {status}" for path, status in detail.items())
+        raise pub.Stop(f"Pages visibility timed out after {VISIBILITY_LIMIT_SECONDS}s"
+                       + (f" ({items})" if items else ""))
+
+    def remaining():
+        left = deadline - time.monotonic()
+        if left <= 0:
+            timed_out()
+        return left
+
+    def read_document(path):
+        nonlocal reading_path
+        remaining()
+        reading_path = path
+        try:
+            raw = pub.public_document(path)
+        finally:
+            reading_path = None
+        remaining()
+        return raw
+
+    def check_marker():
+        try:
+            pub.require(read_document(pub.MARKER) == marker, f"{pub.MARKER}: publication marker differs")
+        except HTTPError as error:
+            error.close()
+            raise pub.Stop(f"{pub.MARKER}: HTTP {error.code}") from error
+
+    def read_mutable(path):
+        try:
+            raw = read_document(path)
+        except HTTPError as error:
+            error.close()
+            if error.code == 503 or (error.code == 404 and path == pub.FRESHNESS and previous_record is None):
+                pending[path] = f"HTTP {error.code}"
+                return None
+            raise pub.Stop(f"{path}: HTTP {error.code}") from error
+        observed = pin(raw)
+        if observed == new_pins[path]:
+            return raw
+        if observed != old_pins[path]:
+            raise pub.Stop(f"{path}: public bytes match neither the prepared update nor its predecessor")
+        pending[path] = "previous publication still visible"
+        return None
+
+    # Bound the wait even when an HTTPS read is still in progress on the Ubuntu Actions runner.
+    old_handler = signal.signal(signal.SIGALRM, timed_out)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, remaining())
+        while True:
+            pending = {}
+            check_marker()
+            read_mutable(pub.FRESHNESS)
+            visible = {path: read_mutable(path) for path in paths}
+            if not pending:
+                def read_pinned(path, expected):
+                    if path in visible:
+                        return visible[path]
+                    return pub.live_pinned_json(path, expected)
+
+                states = pub.check_timestamp_state(plan, expected_record, read_pinned, at=at, upstream_fresh=True)
+                pub.require(all(state.current.signed.expires > at for state in states.values()),
+                            "public timestamp has expired")
+                check_marker()
+                read_mutable(pub.FRESHNESS)
+                if not pending:
+                    return min(state.upstream_expires for state in states.values())
+            if pending != last_pending:
+                detail = "; ".join(f"{path}: {status}" for path, status in pending.items())
+                print(f"Waiting for Pages visibility ({detail})", flush=True)
+            last_pending = pending
+            time.sleep(min(VISIBILITY_POLL_SECONDS, remaining()))
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old_handler)
 
 
 def main():
