@@ -21,10 +21,16 @@ name: Publish approved Colvia Preview
         required: false
         type: boolean
         default: false
+      seed_timestamp_baseline:
+        description: Add the four approved timestamp baseline files to the live v0.1.1 Pages snapshot
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 concurrency:
   group: colvia-preview-publication
+  queue: max
   cancel-in-progress: false
 
 env:
@@ -61,6 +67,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REVIEW_INSTALLATION: ${{ inputs.review_installation }}
+          PAGES_ONLY: ${{ inputs.pages_only }}
+          SEED_TIMESTAMP_BASELINE: ${{ inputs.seed_timestamp_baseline }}
         run: .publish-venv/bin/python -B scripts/publish.py prepare --work .publish-work
       - name: Upload the complete Pages snapshot
         if: steps.prepare.outputs.deploy == 'true'
@@ -90,14 +98,18 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+      - name: Install the verification libraries
+        run: |
+          python3 -m venv .publish-venv
+          .publish-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --only-binary=:all: --no-deps -r scripts/requirements-publish.txt
       - name: Verify anonymous HTTPS responses
         env:
           PAGES_MARKER_SHA256: ${{ needs.pages.outputs.marker_sha256 }}
-        run: python3 -B scripts/publish.py verify --work .publish-work
+        run: .publish-venv/bin/python -B scripts/publish.py verify --work .publish-work
 
   release:
     needs: [pages, verify]
-    if: ${{ !inputs.pages_only }}
+    if: ${{ !inputs.pages_only && !inputs.seed_timestamp_baseline }}
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:

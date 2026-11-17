@@ -1,0 +1,50 @@
+name: Refresh Colvia Preview timestamps
+
+'on':
+  schedule:
+    - cron: '23 2 * * 2'
+  workflow_dispatch:
+
+permissions: {}
+concurrency:
+  group: colvia-preview-publication
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    if: github.repository == 'colvia/downloads' && github.ref == 'refs/heads/main' && vars.COLVIA_APPROVED_MANIFEST_SHA256 != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    environment:
+      name: preview-timestamp
+      url: https://colvia.github.io/downloads/
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    env:
+      COLVIA_APPROVED_MANIFEST_SHA256: ${{ vars.COLVIA_APPROVED_MANIFEST_SHA256 }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Install the pinned verification libraries
+        run: |
+          python3 -m venv .publish-venv
+          .publish-venv/bin/python -m pip install --disable-pip-version-check --no-cache-dir --only-binary=:all: --no-deps -r scripts/requirements-publish.txt
+      - name: Check approval and prepare all three timestamps
+        env:
+          COLVIA_TIMESTAMP_KEY_B64: ${{ secrets.COLVIA_TIMESTAMP_KEY_B64 }}
+        run: .publish-venv/bin/python -B scripts/refresh_timestamp.py prepare --work .timestamp-work
+      - name: Upload the verified Pages snapshot
+        uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3.0.1
+        with:
+          path: .timestamp-work/site
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Deploy Pages
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5
+        with:
+          artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+      - name: Verify public timestamps and check upstream expiry
+        run: .publish-venv/bin/python -B scripts/refresh_timestamp.py verify --work .timestamp-work
