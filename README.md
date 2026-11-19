@@ -1,4 +1,14 @@
-# Colvia Preview publication
+# Colvia Preview downloads
+
+| | English | 한국어 |
+| --- | --- | --- |
+| Install or update · 설치·업데이트 | [Copy the command for your platform](https://colvia.github.io/downloads/#en) | [내 운영체제에 맞는 명령 복사](https://colvia.github.io/downloads/#ko) |
+| Preview releases · 배포판 | [Release notes, ZIP files and checksums](https://github.com/colvia/downloads/releases) | [릴리스 노트·ZIP·체크섬](https://github.com/colvia/downloads/releases) |
+| Source and user guide · 소스·사용 안내 | [Colvia on GitHub](https://github.com/kyungseo/colvia) | [Colvia 한국어 README](https://github.com/kyungseo/colvia/blob/main/README.ko.md) |
+
+To update, run the same installation command again in the account where you installed Colvia. 업데이트할 때는 Colvia를 설치한 계정에서 같은 설치 명령을 다시 실행하세요.
+
+## Publishing a Preview
 
 Run these files in `colvia/downloads`. The workflow consumes an already signed, approved snapshot. It publishes the Pages snapshot, checks the files at their public HTTPS URLs, then publishes a GitHub prerelease with the exact same three platform ZIPs and their SHA-256 checksums.
 
