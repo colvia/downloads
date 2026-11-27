@@ -139,6 +139,12 @@ class Plan:
         return encode({"tag": self.tag, "manifest_sha256": self.digest,
                        "root_sha256": self.data["root_sha256"], "pages": self.data["pages"]})
 
+    def platform_zip(self, platform):
+        cfg = self.data["platforms"][platform]
+        if "retained_zip" in cfg:
+            return cfg["retained_zip"]
+        return self.data["release_zips"][f"colvia-{self.tag}-{platform}.zip"]
+
     @property
     def release_pins(self):
         pages = self.data["pages"]
@@ -159,7 +165,7 @@ def read_plan(raw, tag, digest):
         "schema", "tag", "channel", "source_commit", "base_url", "previous_manifest_sha256",
         "root_sha256", "pages", "platforms", "release_zips", "checksums", "notes",
     }, "invalid manifest fields")
-    require(type(data["schema"]) is int and data["schema"] == 1 and data["tag"] == tag and
+    require(type(data["schema"]) is int and data["schema"] in (1, 2) and data["tag"] == tag and
             data["channel"] == CHANNEL and data["base_url"] == BASE and
             isinstance(data["source_commit"], str) and
             re.fullmatch(r"[0-9a-f]{40}", data["source_commit"]), "invalid release identity")
@@ -172,10 +178,15 @@ def read_plan(raw, tag, digest):
     require(isinstance(data["platforms"], dict) and set(data["platforms"]) == set(PLATFORMS),
             "expected all three platform configurations")
     expected_zips = {}
+    zips = data["release_zips"]
+    require(isinstance(zips, dict) and zips, "expected at least one Release ZIP")
     for platform, entry_name in PLATFORMS.items():
         prefix = f"preview/{platform}/"
         cfg = data["platforms"][platform]
-        require(isinstance(cfg, dict) and set(cfg) == {"bootstrap", "target"}, f"invalid {platform} configuration")
+        fields = {"bootstrap", "target"}
+        require(isinstance(cfg, dict) and (set(cfg) == fields or
+                (data["schema"] == 2 and set(cfg) == fields | {"retained_zip"})),
+                f"invalid {platform} configuration")
         bootstrap, target = cfg["bootstrap"], cfg["target"]
         require(isinstance(bootstrap, str) and bootstrap.startswith(prefix + "bootstrap/") and
                 bootstrap in pages and safe_path(target) and "/" not in target and target.endswith(".zip"),
@@ -189,8 +200,11 @@ def read_plan(raw, tag, digest):
                  path == prefix + "targets/" + pages[path]["sha256"] + "." + target]
         # The selected target is explicit in the release map when older target bytes are retained.
         asset_name = f"colvia-{tag}-{platform}.zip"
-        zips = data["release_zips"]
-        require(isinstance(zips, dict) and zips.get(asset_name) in found, f"invalid {platform} release ZIP")
+        if "retained_zip" in cfg:
+            require(previous is not None and cfg["retained_zip"] in found,
+                    f"invalid {platform} retained ZIP or missing predecessor")
+            continue
+        require(zips.get(asset_name) in found, f"invalid {platform} release ZIP")
         expected_zips[asset_name] = zips[asset_name]
     require(data["release_zips"] == expected_zips, "unexpected Release attachments")
     require(len(Plan(tag, digest, data).marker) <= JSON_LIMIT, "publication marker is too large")
@@ -244,7 +258,8 @@ def make_input(spec_path, source, output, work):
     pages = {name: file_pin(path) for name, path in files.items()}
     require(isinstance(spec["release_zips"], dict), "invalid release ZIP mapping")
     sums = "".join(f"{pages[path]['sha256']}  {name}\n" for name, path in sorted(spec["release_zips"].items())).encode()
-    data = dict(spec, schema=1, channel=CHANNEL, base_url=BASE, pages=pages,
+    schema = 2 if any("retained_zip" in cfg for cfg in spec["platforms"].values()) else 1
+    data = dict(spec, schema=schema, channel=CHANNEL, base_url=BASE, pages=pages,
                 notes=file_pin(notes, JSON_LIMIT), checksums={"bytes": len(sums), "sha256": sha(sums)})
     raw = encode(data)
     plan = read_plan(raw, spec["tag"], sha(raw))
@@ -303,7 +318,7 @@ def verify_trust(plan, payload, work, *, channel=CHANNEL, timestamps=None):
         bundle = payload / bootstrap
         installation, _ = zip_json(bundle, "installation.json")
         _, anchor = zip_json(bundle, "trust/root.json")
-        target_path = plan.data["release_zips"][f"colvia-{plan.tag}-{platform}.zip"]
+        target_path = plan.platform_zip(platform)
         target_config, _ = zip_json(payload / target_path, "installation.json")
         _, target_root = zip_json(payload / target_path, "trust/root.json")
         target_manifest, target_manifest_raw = zip_json(payload / target_path, "manifest.json", 4 * 1024 * 1024)
@@ -320,6 +335,8 @@ def verify_trust(plan, payload, work, *, channel=CHANNEL, timestamps=None):
                 and type(target_manifest.get("sequence")) is int and target_manifest["sequence"] > 0
                 and isinstance(target_manifest.get("release"), str) and target_manifest["release"],
                 f"{platform} target identity differs")
+        if plan.data["schema"] == 2 and "retained_zip" not in cfg:
+            require(target_manifest["release"] == plan.tag[1:], f"{platform} release version differs from tag")
         expected_custom = {"colvia": {
             "version": 1, "channel": channel, "os": os_name, "architecture": architecture,
             "release": target_manifest["release"], "sequence": target_manifest["sequence"],
@@ -552,7 +569,7 @@ def check_timestamp_state(plan, record_raw, read, *, at, upstream_fresh):
             targets = referenced_metadata(read, pages, prefix, "targets", snapshot.signed.meta["targets.json"])
             verify("targets", targets.signed_bytes, targets.signatures)
             selected = targets.signed.targets[plan.data["platforms"][platform]["target"]]
-            zip_path = plan.data["release_zips"][f"colvia-{plan.tag}-{platform}.zip"]
+            zip_path = plan.platform_zip(platform)
             zip_pin = plan.data["pages"][zip_path]
             require(selected.length == zip_pin["bytes"] and selected.hashes == {"sha256": zip_pin["sha256"]},
                     "targets selects a different ZIP")
@@ -575,6 +592,15 @@ def live_freshness(marker, digest, *, upstream_fresh=True, require_approval=Fals
     states = check_timestamp_state(plan, record, live_pinned_json, at=datetime.now(timezone.utc),
                                    upstream_fresh=upstream_fresh)
     return record, {path: state.raw for path, state in states.items()}, freshness_pins(plan, record)
+
+
+def verify_retained_platforms(plan, old_pages):
+    for platform, cfg in plan.data["platforms"].items():
+        if "retained_zip" in cfg:
+            prefix = f"preview/{platform}/"
+            before = {p: v for p, v in old_pages.items() if p.startswith(prefix)}
+            after = {p: v for p, v in plan.data["pages"].items() if p.startswith(prefix)}
+            require(before == after, f"retained platform files changed: {platform}")
 
 
 def verify_timestamp_progress(old_pages, payload):
@@ -865,6 +891,7 @@ def main():
         def verify_predecessor(old):
             previous = plan.data["previous_manifest_sha256"]
             record, _, effective = live_freshness(live, previous, upstream_fresh=False)
+            verify_retained_platforms(plan, effective or old)
             verify_timestamp_progress(effective or old, payload)
             require(read_marker() == live and public_document(FRESHNESS, missing=True) == record,
                     "Pages changed during predecessor verification")

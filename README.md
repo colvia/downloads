@@ -51,6 +51,8 @@ GitHub's Release list returns drafts to callers with repository write access. Th
 }
 ```
 
+For a platform-specific patch, keep all three installation channels in `platforms`. For each platform staying on its current version, add `retained_zip` to its configuration with the currently selected target's complete Pages path. Carry forward that platform's complete live file inventory, including its current timestamp, byte for byte. Include only the updated platforms in `release_zips`. For example, a Windows x64 patch has one ZIP attachment and one entry in `SHA256SUMS.txt`. The other platforms continue to use their previously signed targets. The publisher verifies the trust chain for every platform, including during timestamp refresh.
+
 3. Run `pack` with the pinned verifier libraries from `scripts/requirements-publish.txt` or the already qualified verifier supply on a compatible Python. Use new directories for the output and check workspace. This command generates the two staging assets, verifies their bytes, and reads the signed TUF chain using the trust root embedded in the approved bootstrap. It does not use a GitHub login.
 
 ```sh
